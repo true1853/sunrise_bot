@@ -18,7 +18,7 @@ from astral import Observer
 from astral.sun import sun
 from timezonefinder import TimezoneFinder
 
-# Импорт токена из отдельного файла конфигурации
+# Импорт токена из файла config.py
 from config import BOT_TOKEN
 
 #############################################
@@ -37,13 +37,16 @@ notified_events_global = {}
 # Файл для хранения глобальной локации
 DATABASE_NAME = "global_settings.db"
 
+# Время напоминания (смещение уведомления) в минутах
+REMINDER_OFFSET = 10
+
 #############################################
 # Функции работы с базой данных
 #############################################
 
 def init_db():
     """
-    Инициализирует БД: создает таблицу для настроек и загружает глобальную локацию.
+    Инициализирует БД: создаёт таблицу для настроек и загружает глобальную локацию (если она существует).
     """
     conn = sqlite3.connect(DATABASE_NAME)
     cursor = conn.cursor()
@@ -96,7 +99,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Привет! 😀\n\n"
         "Команды:\n"
         "📍 /setlocation – установить локацию\n"
-        "⏰ /times – время рассвета/заката"
+        f"⏰ /times – время рассвета/заката (напоминание за {REMINDER_OFFSET} мин)"
     )
     await update.message.reply_text(text)
 
@@ -124,7 +127,7 @@ async def setlocation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Всегда обновляет глобальную локацию при получении геолокации.
+    Обрабатывает сообщение с локацией и всегда обновляет глобальную локацию.
     """
     if update.message.location:
         lat = update.message.location.latitude
@@ -176,53 +179,64 @@ async def times(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # Планировщик уведомлений
 #############################################
 
+async def job_wrapper():
+    """
+    Обёртка для check_notifications, позволяющая отлавливать непредусмотренные исключения.
+    """
+    try:
+        await check_notifications()
+    except Exception as e:
+        logging.exception("Unhandled exception in job_wrapper: %s", e)
+
 async def check_notifications():
     """
-    Каждые 30 сек. проверяет, не наступило ли время отправки уведомлений
-    (за 10 мин до рассвета/заката) и рассылает их с датой и упоминаниями.
+    Каждые 30 сек. проверяет, наступило ли время для отправки уведомлений
+    (за REMINDER_OFFSET мин до рассвета/заката) и рассылает их с датой и упоминаниями.
     """
-    if not global_location:
-        return
-    lat = global_location['lat']
-    lon = global_location['lon']
-    tz_str = global_location['tz']
-    tz = pytz.timezone(tz_str)
-    now = datetime.now(tz)
-    observer = Observer(latitude=lat, longitude=lon)
     try:
-        s = sun(observer, date=now.date(), tzinfo=tz)
+        if not global_location:
+            return
+        lat = global_location['lat']
+        lon = global_location['lon']
+        tz_str = global_location['tz']
+        tz = pytz.timezone(tz_str)
+        now = datetime.now(tz)
+        observer = Observer(latitude=lat, longitude=lon)
+        try:
+            s = sun(observer, date=now.date(), tzinfo=tz)
+        except Exception as e:
+            logging.exception("Ошибка расчёта для уведомлений")
+            return
+
+        sunrise_notif = s["sunrise"] - timedelta(minutes=REMINDER_OFFSET)
+        sunset_notif = s["sunset"] - timedelta(minutes=REMINDER_OFFSET)
+        date_str = now.strftime("%Y-%m-%d")
+
+        for chat_id, subs in subscribed_chats.items():
+            mentions = " ".join([f"<a href='tg://user?id={uid}'>{name}</a>" for uid, name in subs.items()])
+            key_sr = (chat_id, now.date(), "sunrise")
+            if key_sr not in notified_events_global:
+                if abs((now - sunrise_notif).total_seconds()) < 30:
+                    try:
+                        msg = f"📅 {date_str}\n⏰ 10 мин до рассвета 🌅 {mentions}"
+                        await application.bot.send_message(chat_id, msg, parse_mode="HTML")
+                        notified_events_global[key_sr] = True
+                    except Exception as e:
+                        logging.exception("Ошибка уведомления рассвета в чате %s", chat_id)
+            key_ss = (chat_id, now.date(), "sunset")
+            if key_ss not in notified_events_global:
+                if abs((now - sunset_notif).total_seconds()) < 30:
+                    try:
+                        msg = f"📅 {date_str}\n⏰ 10 мин до заката 🌇 {mentions}"
+                        await application.bot.send_message(chat_id, msg, parse_mode="HTML")
+                        notified_events_global[key_ss] = True
+                    except Exception as e:
+                        logging.exception("Ошибка уведомления заката в чате %s", chat_id)
     except Exception as e:
-        logging.exception("Ошибка расчёта для уведомлений")
-        return
-
-    sunrise_notif = s["sunrise"] - timedelta(minutes=10)
-    sunset_notif = s["sunset"] - timedelta(minutes=10)
-    date_str = now.strftime("%Y-%m-%d")
-
-    for chat_id, subs in subscribed_chats.items():
-        # Формируем упоминания пользователей (HTML)
-        mentions = " ".join([f"<a href='tg://user?id={uid}'>{name}</a>" for uid, name in subs.items()])
-        key_sr = (chat_id, now.date(), "sunrise")
-        if key_sr not in notified_events_global:
-            if abs((now - sunrise_notif).total_seconds()) < 30:
-                try:
-                    msg = f"📅 {date_str}\n⏰ 10 мин до рассвета 🌅 {mentions}"
-                    await application.bot.send_message(chat_id, msg, parse_mode="HTML")
-                    notified_events_global[key_sr] = True
-                except Exception as e:
-                    logging.exception("Ошибка уведомления рассвета в чате %s", chat_id)
-        key_ss = (chat_id, now.date(), "sunset")
-        if key_ss not in notified_events_global:
-            if abs((now - sunset_notif).total_seconds()) < 30:
-                try:
-                    msg = f"📅 {date_str}\n⏰ 10 мин до заката 🌇 {mentions}"
-                    await application.bot.send_message(chat_id, msg, parse_mode="HTML")
-                    notified_events_global[key_ss] = True
-                except Exception as e:
-                    logging.exception("Ошибка уведомления заката в чате %s", chat_id)
+        logging.exception("Unhandled exception in check_notifications: %s", e)
 
 def clear_notified_events():
-    """Очищает уведомления для предыдущих дней."""
+    """Очищает записи уведомлений для предыдущих дней."""
     today = date.today()
     keys = [k for k in notified_events_global if k[1] != today]
     for k in keys:
@@ -231,20 +245,16 @@ def clear_notified_events():
 async def start_scheduler():
     """Запускает APScheduler для уведомлений."""
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(lambda: asyncio.create_task(check_notifications()), 'interval', seconds=30)
+    scheduler.add_job(lambda: asyncio.create_task(job_wrapper()), 'interval', seconds=30)
     scheduler.add_job(clear_notified_events, 'cron', hour=0, minute=1)
     scheduler.start()
     logging.info("Scheduler запущен.")
-
-#############################################
-# Меню команд бота
-#############################################
 
 async def set_bot_commands(app: Application) -> None:
     cmds = [
         BotCommand("start", "Начало 😀"),
         BotCommand("setlocation", "📍 Локация"),
-        BotCommand("times", "⏰ Время")
+        BotCommand("times", f"⏰ Время (напоминание за {REMINDER_OFFSET} мин)")
     ]
     await app.bot.set_my_commands(cmds)
     logging.info("Команды установлены.")
