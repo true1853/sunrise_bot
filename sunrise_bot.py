@@ -2,6 +2,7 @@
 import logging
 import asyncio
 import sqlite3
+import math
 from datetime import datetime, timedelta, date
 import pytz
 from telegram import (
@@ -14,8 +15,9 @@ from telegram import (
 )
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from astral import Observer
-from astral.sun import sun
+# Удалён импорт из astral (он больше не используется для расчёта)
+#from astral import Observer
+#from astral.sun import sun
 from timezonefinder import TimezoneFinder
 
 # Импорт токена из файла config.py
@@ -34,10 +36,7 @@ subscribed_chats = {}
 # Словарь для отслеживания отправленных уведомлений: ключ (chat_id, дата, тип_события)
 notified_events_global = {}
 
-# Файл для хранения глобальной локации
 DATABASE_NAME = "global_settings.db"
-
-# Время напоминания (смещение уведомления) в минутах
 REMINDER_OFFSET = 10
 
 #############################################
@@ -45,9 +44,6 @@ REMINDER_OFFSET = 10
 #############################################
 
 def init_db():
-    """
-    Инициализирует БД: создаёт таблицу для настроек и загружает глобальную локацию (если она существует).
-    """
     conn = sqlite3.connect(DATABASE_NAME)
     cursor = conn.cursor()
     cursor.execute('''
@@ -68,7 +64,6 @@ def init_db():
     conn.close()
 
 def save_global_location(lat: float, lon: float, tz: str):
-    """Сохраняет глобальную локацию в БД."""
     conn = sqlite3.connect(DATABASE_NAME)
     cursor = conn.cursor()
     cursor.execute("SELECT id FROM global_settings WHERE id = 1")
@@ -80,35 +75,80 @@ def save_global_location(lat: float, lon: float, tz: str):
     conn.close()
 
 #############################################
-# Настройка логирования
+# Новый блок: Расчёт времени рассвета/заката по уравнению восхода
 #############################################
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logging.getLogger('apscheduler').setLevel(logging.WARNING)
+def calculate_sun_times(cur_date: date, lat: float, lon: float, tzinfo):
+    """
+    Вычисляет время рассвета и заката для указанной даты и координат по классическому уравнению.
+    Поправка: угол -0.83° учитывает атмосферную рефракцию и солнечный диск.
+    """
+    def deg2rad(d): 
+        return math.radians(d)
+    def rad2deg(r): 
+        return math.degrees(r)
+    
+    # Вычисление Юлианской даты для 0 UTC данного дня
+    year, month, day = cur_date.year, cur_date.month, cur_date.day
+    if month <= 2:
+        year -= 1
+        month += 12
+    A = year // 100
+    B = 2 - A + (A // 4)
+    J0 = int(365.25*(year+4716)) + int(30.6001*(month+1)) + day + B - 1524.5
+
+    # Смещённое число дней
+    n = J0 - 2451545.0 + 0.0008
+    # Приблизительное время солнечного полудня (J*)
+    J_star = n - (lon / 360)
+    # Средняя аномалия Солнца
+    M = (357.5291 + 0.98560028 * J_star) % 360
+    M_rad = deg2rad(M)
+    # Центрическая коррекция
+    C = 1.9148 * math.sin(M_rad) + 0.0200 * math.sin(2 * M_rad) + 0.0003 * math.sin(3 * M_rad)
+    # Экллиптическая долгота Солнца
+    lambda_sun = (M + C + 180 + 102.9372) % 360
+    lambda_rad = deg2rad(lambda_sun)
+    # Точное время прохождения полудня
+    J_transit = 2451545.0 + J_star + 0.0053 * math.sin(M_rad) - 0.0069 * math.sin(2 * lambda_rad)
+    # Склонение Солнца
+    delta = math.asin(math.sin(lambda_rad) * math.sin(deg2rad(23.44)))
+    # Часовой угол (учитываем угол -0.83°)
+    h0 = deg2rad(-0.83)
+    lat_rad = deg2rad(lat)
+    cos_omega = (math.sin(h0) - math.sin(lat_rad)*math.sin(delta)) / (math.cos(lat_rad)*math.cos(delta))
+    cos_omega = max(min(cos_omega, 1), -1)
+    omega = math.acos(cos_omega)
+    omega_deg = rad2deg(omega)
+    # Юлианские даты восхода и заката
+    J_rise = J_transit - omega_deg/360.0
+    J_set = J_transit + omega_deg/360.0
+
+    def julian_to_datetime(j):
+        timestamp = (j - 2440587.5) * 86400.0
+        return datetime.utcfromtimestamp(timestamp).replace(tzinfo=pytz.utc)
+    
+    sunrise_utc = julian_to_datetime(J_rise)
+    sunset_utc = julian_to_datetime(J_set)
+    sunrise_local = sunrise_utc.astimezone(tzinfo)
+    sunset_local = sunset_utc.astimezone(tzinfo)
+    return sunrise_local, sunset_local
 
 #############################################
 # Обработчики команд
 #############################################
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Приветствие и меню команд."""
     text = (
         "Привет! 😀\n\n"
         "Команды:\n"
         "📍 /setlocation – установить локацию\n"
-        f"⏰ /times – время рассвета/заката (напоминание за {REMINDER_OFFSET} мин)"
+        f"⏰ /times – время рассвета/заката (напоминание за {REMINDER_OFFSET} мин)\n"
+        "🧪 /test – тест уведомлений"
     )
     await update.message.reply_text(text)
 
 async def setlocation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Устанавливает глобальную локацию:
-      – Если вызвано в группе, предлагает перейти в ЛС.
-      – В ЛС отправляет кнопку для запроса локации.
-    """
     chat_type = update.effective_chat.type
     if chat_type in ("group", "supergroup"):
         me = await context.bot.get_me()
@@ -120,15 +160,11 @@ async def setlocation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await update.message.reply_text("Напиши в ЛС для установки локации.", reply_markup=inline_kb)
         return
 
-    # В личном чате отправляем кнопку для запроса локации
     button = KeyboardButton("📍 Отправить локацию", request_location=True)
     kb = ReplyKeyboardMarkup([[button]], resize_keyboard=True, one_time_keyboard=True)
     await update.message.reply_text("Отправь свою локацию:", reply_markup=kb)
 
 async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Обрабатывает сообщение с локацией и всегда обновляет глобальную локацию.
-    """
     if update.message.location:
         lat = update.message.location.latitude
         lon = update.message.location.longitude
@@ -142,10 +178,6 @@ async def location_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await update.message.reply_text("❌ Локация не получена.")
 
 async def times(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Вычисляет и выводит время рассвета и заката с датой.
-    Подписывает чат на уведомления и сохраняет информацию о пользователе для упоминания.
-    """
     if not global_location:
         await update.message.reply_text("Локация не установлена. Используй /setlocation")
         return
@@ -155,16 +187,16 @@ async def times(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     tz_str = global_location['tz']
     tz = pytz.timezone(tz_str)
     now = datetime.now(tz)
-    observer = Observer(latitude=lat, longitude=lon)
     try:
-        s = sun(observer, date=now.date(), tzinfo=tz)
+        # Используем нашу функцию для расчёта рассвета/заката
+        sunrise_dt, sunset_dt = calculate_sun_times(now.date(), lat, lon, tz)
     except Exception as e:
         logging.exception("Ошибка расчёта")
         await update.message.reply_text("Ошибка расчёта времени ❌")
         return
 
-    sunrise = s["sunrise"].strftime("%H:%M:%S")
-    sunset = s["sunset"].strftime("%H:%M:%S")
+    sunrise = sunrise_dt.strftime("%H:%M:%S")
+    sunset = sunset_dt.strftime("%H:%M:%S")
     date_str = now.strftime("%Y-%m-%d")
     chat_id = update.effective_chat.id
     user = update.effective_user
@@ -176,23 +208,34 @@ async def times(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text)
 
 #############################################
-# Планировщик уведомлений
+# Новый хелпер: Отправка уведомлений с обработкой ошибок в группах
+#############################################
+
+async def send_notification(chat_id, msg, key):
+    try:
+        await application.bot.send_message(chat_id, msg, parse_mode="HTML")
+        notified_events_global[key] = True
+    except Exception as e:
+        logging.exception("Ошибка уведомления в чате %s, пробую отправить без HTML", chat_id)
+        try:
+            # Убираем HTML‑теги для групп
+            plain_msg = msg.replace("<a href='tg://user?id=", "").replace("'>", " ").replace("</a>", "")
+            await application.bot.send_message(chat_id, plain_msg)
+            notified_events_global[key] = True
+        except Exception as e2:
+            logging.exception("Не удалось отправить уведомление в чате %s", chat_id)
+
+#############################################
+# Механизм уведомлений
 #############################################
 
 async def job_wrapper():
-    """
-    Обёртка для check_notifications, позволяющая отлавливать непредусмотренные исключения.
-    """
     try:
         await check_notifications()
     except Exception as e:
         logging.exception("Unhandled exception in job_wrapper: %s", e)
 
 async def check_notifications():
-    """
-    Каждые 30 сек. проверяет, наступило ли время для отправки уведомлений
-    (за REMINDER_OFFSET мин до рассвета/заката) и рассылает их с датой и упоминаниями.
-    """
     try:
         if not global_location:
             return
@@ -201,15 +244,15 @@ async def check_notifications():
         tz_str = global_location['tz']
         tz = pytz.timezone(tz_str)
         now = datetime.now(tz)
-        observer = Observer(latitude=lat, longitude=lon)
         try:
-            s = sun(observer, date=now.date(), tzinfo=tz)
+            # Используем нашу функцию расчёта
+            sunrise_dt, sunset_dt = calculate_sun_times(now.date(), lat, lon, tz)
         except Exception as e:
             logging.exception("Ошибка расчёта для уведомлений")
             return
 
-        sunrise_notif = s["sunrise"] - timedelta(minutes=REMINDER_OFFSET)
-        sunset_notif = s["sunset"] - timedelta(minutes=REMINDER_OFFSET)
+        sunrise_notif = sunrise_dt - timedelta(minutes=REMINDER_OFFSET)
+        sunset_notif = sunset_dt - timedelta(minutes=REMINDER_OFFSET)
         date_str = now.strftime("%Y-%m-%d")
 
         for chat_id, subs in subscribed_chats.items():
@@ -217,33 +260,23 @@ async def check_notifications():
             key_sr = (chat_id, now.date(), "sunrise")
             if key_sr not in notified_events_global:
                 if abs((now - sunrise_notif).total_seconds()) < 30:
-                    try:
-                        msg = f"📅 {date_str}\n⏰ 10 мин до рассвета 🌅 {mentions}"
-                        await application.bot.send_message(chat_id, msg, parse_mode="HTML")
-                        notified_events_global[key_sr] = True
-                    except Exception as e:
-                        logging.exception("Ошибка уведомления рассвета в чате %s", chat_id)
+                    msg = f"📅 {date_str}\n⏰ 10 мин до рассвета 🌅 {mentions}"
+                    await send_notification(chat_id, msg, key_sr)
             key_ss = (chat_id, now.date(), "sunset")
             if key_ss not in notified_events_global:
                 if abs((now - sunset_notif).total_seconds()) < 30:
-                    try:
-                        msg = f"📅 {date_str}\n⏰ 10 мин до заката 🌇 {mentions}"
-                        await application.bot.send_message(chat_id, msg, parse_mode="HTML")
-                        notified_events_global[key_ss] = True
-                    except Exception as e:
-                        logging.exception("Ошибка уведомления заката в чате %s", chat_id)
+                    msg = f"📅 {date_str}\n⏰ 10 мин до заката 🌇 {mentions}"
+                    await send_notification(chat_id, msg, key_ss)
     except Exception as e:
         logging.exception("Unhandled exception in check_notifications: %s", e)
 
 def clear_notified_events():
-    """Очищает записи уведомлений для предыдущих дней."""
     today = date.today()
     keys = [k for k in notified_events_global if k[1] != today]
     for k in keys:
         del notified_events_global[k]
 
 async def start_scheduler():
-    """Запускает APScheduler для уведомлений."""
     scheduler = AsyncIOScheduler()
     scheduler.add_job(lambda: asyncio.create_task(job_wrapper()), 'interval', seconds=30)
     scheduler.add_job(clear_notified_events, 'cron', hour=0, minute=1)
@@ -254,10 +287,41 @@ async def set_bot_commands(app: Application) -> None:
     cmds = [
         BotCommand("start", "Начало 😀"),
         BotCommand("setlocation", "📍 Локация"),
-        BotCommand("times", f"⏰ Время (напоминание за {REMINDER_OFFSET} мин)")
+        BotCommand("times", f"⏰ Время (напоминание за {REMINDER_OFFSET} мин)"),
+        BotCommand("test", "🧪 Тест уведомлений")
     ]
     await app.bot.set_my_commands(cmds)
     logging.info("Команды установлены.")
+
+#############################################
+# Механизм тестирования (новая команда /test)
+#############################################
+
+async def test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not global_location:
+        await update.message.reply_text("Локация не установлена. Используй /setlocation")
+        return
+
+    lat = global_location['lat']
+    lon = global_location['lon']
+    tz_str = global_location['tz']
+    tz = pytz.timezone(tz_str)
+    now = datetime.now(tz)
+    try:
+        sunrise_dt, sunset_dt = calculate_sun_times(now.date(), lat, lon, tz)
+    except Exception as e:
+        logging.exception("Ошибка расчёта для теста")
+        await update.message.reply_text("Ошибка расчёта времени для теста ❌")
+        return
+
+    sunrise = sunrise_dt.strftime("%H:%M:%S")
+    sunset = sunset_dt.strftime("%H:%M:%S")
+    date_str = now.strftime("%Y-%m-%d")
+    test_msg_sr = f"[TEST] 📅 {date_str}\n⏰ 10 мин до рассвета 🌅 (тестовое уведомление)"
+    test_msg_ss = f"[TEST] 📅 {date_str}\n⏰ 10 мин до заката 🌇 (тестовое уведомление)"
+    await update.message.reply_text(f"Тест: время рассвета {sunrise}, время заката {sunset}")
+    await update.message.reply_text(test_msg_sr)
+    await update.message.reply_text(test_msg_ss)
 
 #############################################
 # Основная функция
@@ -270,6 +334,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("setlocation", setlocation))
     application.add_handler(CommandHandler("times", times))
+    application.add_handler(CommandHandler("test", test))
     application.add_handler(MessageHandler(filters.LOCATION, location_handler))
     loop = asyncio.get_event_loop()
     loop.create_task(start_scheduler())
