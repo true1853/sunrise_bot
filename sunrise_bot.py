@@ -14,27 +14,19 @@ from telegram import (
 )
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-# Возвращаем импорт из astral – он используется для расчёта времени
 from astral import Observer
 from astral.sun import sun
 from timezonefinder import TimezoneFinder
 
-# Импорт токена из файла config.py
 from config import BOT_TOKEN
 
 #############################################
 # Глобальные переменные и настройки
 #############################################
 
-# Глобальная локация для всего приложения (формат: {"lat": float, "lon": float, "tz": str})
 global_location = None
-
-# Подписанные чаты – словарь: { chat_id: {user_id: first_name, ...} }
 subscribed_chats = {}
-
-# Словарь для отслеживания отправленных уведомлений: ключ (chat_id, дата, тип_события)
 notified_events_global = {}
-
 DATABASE_NAME = "global_settings.db"
 REMINDER_OFFSET = 10
 
@@ -82,7 +74,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Привет! 😀\n\n"
         "Команды:\n"
         "📍 /setlocation – установить локацию\n"
-        f"⏰ /times – время рассвета/заката (напоминание за {REMINDER_OFFSET} мин)\n"
+        f"⏰ /times – время рассвета/заката (напоминание за {REMINDER_OFFSET} мин) с данными на сегодня и завтра\n"
         "🧪 /test – тест уведомлений"
     )
     await update.message.reply_text(text)
@@ -128,26 +120,38 @@ async def times(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now(tz)
     observer = Observer(latitude=lat, longitude=lon)
     try:
-        s = sun(observer, date=now.date(), tzinfo=tz)
+        s_today = sun(observer, date=now.date(), tzinfo=tz)
+        tomorrow_date = now.date() + timedelta(days=1)
+        s_tomorrow = sun(observer, date=tomorrow_date, tzinfo=tz)
     except Exception as e:
         logging.exception("Ошибка расчёта")
         await update.message.reply_text("Ошибка расчёта времени ❌")
         return
 
-    sunrise = s["sunrise"].strftime("%H:%M:%S")
-    sunset = s["sunset"].strftime("%H:%M:%S")
-    date_str = now.strftime("%Y-%m-%d")
+    sunrise_today = s_today["sunrise"].strftime("%H:%M:%S")
+    sunset_today = s_today["sunset"].strftime("%H:%M:%S")
+    sunrise_tomorrow = s_tomorrow["sunrise"].strftime("%H:%M:%S")
+    sunset_tomorrow = s_tomorrow["sunset"].strftime("%H:%M:%S")
+
+    date_today_str = now.strftime("%Y-%m-%d")
+    date_tomorrow_str = tomorrow_date.strftime("%Y-%m-%d")
+
     chat_id = update.effective_chat.id
     user = update.effective_user
     if chat_id not in subscribed_chats:
         subscribed_chats[chat_id] = {}
     subscribed_chats[chat_id][user.id] = user.first_name
 
-    text = f"📅 {date_str}\n🌅 {sunrise}\n🌇 {sunset}"
+    text = (f"Сегодня ({date_today_str}):\n"
+            f"🌅 Рассвет: {sunrise_today}\n"
+            f"🌇 Закат: {sunset_today}\n\n"
+            f"Завтра ({date_tomorrow_str}):\n"
+            f"🌅 Рассвет: {sunrise_tomorrow}\n"
+            f"🌇 Закат: {sunset_tomorrow}")
     await update.message.reply_text(text)
 
 #############################################
-# Новый хелпер: Отправка уведомлений с обработкой ошибок в группах
+# Хелпер для отправки уведомлений
 #############################################
 
 async def send_notification(chat_id, msg, key):
@@ -198,14 +202,16 @@ async def check_notifications():
 
         for chat_id, subs in subscribed_chats.items():
             mentions = " ".join([f"<a href='tg://user?id={uid}'>{name}</a>" for uid, name in subs.items()])
+            
             key_sr = (chat_id, now.date(), "sunrise")
             if key_sr not in notified_events_global:
-                if abs((now - sunrise_notif).total_seconds()) < 30:
+                if now >= sunrise_notif and now < sunrise_notif + timedelta(seconds=60):
                     msg = f"📅 {date_str}\n⏰ 10 мин до рассвета 🌅 {mentions}"
                     await send_notification(chat_id, msg, key_sr)
+            
             key_ss = (chat_id, now.date(), "sunset")
             if key_ss not in notified_events_global:
-                if abs((now - sunset_notif).total_seconds()) < 30:
+                if now >= sunset_notif and now < sunset_notif + timedelta(seconds=60):
                     msg = f"📅 {date_str}\n⏰ 10 мин до заката 🌇 {mentions}"
                     await send_notification(chat_id, msg, key_ss)
     except Exception as e:
@@ -235,7 +241,7 @@ async def set_bot_commands(app: Application) -> None:
     logging.info("Команды установлены.")
 
 #############################################
-# Механизм тестирования (команда /test)
+# Команда тестирования уведомлений (/test)
 #############################################
 
 async def test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
