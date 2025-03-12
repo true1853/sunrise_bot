@@ -28,7 +28,7 @@ global_location = None
 subscribed_chats = {}
 notified_events_global = {}
 DATABASE_NAME = "global_settings.db"
-REMINDER_OFFSET = 10
+REMINDER_OFFSET = 10  # базовое смещение – используется для уведомлений, далее будут 10, 30 и 60 мин
 
 #############################################
 # Функции работы с базой данных
@@ -74,7 +74,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Привет! 😀\n\n"
         "Команды:\n"
         "📍 /setlocation – установить локацию\n"
-        f"⏰ /times – время рассвета/заката (напоминание за {REMINDER_OFFSET} мин) с данными на сегодня и завтра\n"
+        "⏰ /times – время рассвета/заката на сегодня и завтра (напоминания)\n"
         "🧪 /test – тест уведомлений"
     )
     await update.message.reply_text(text)
@@ -120,7 +120,9 @@ async def times(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now(tz)
     observer = Observer(latitude=lat, longitude=lon)
     try:
+        # Получаем данные на сегодня
         s_today = sun(observer, date=now.date(), tzinfo=tz)
+        # Получаем данные на завтра
         tomorrow_date = now.date() + timedelta(days=1)
         s_tomorrow = sun(observer, date=tomorrow_date, tzinfo=tz)
     except Exception as e:
@@ -142,10 +144,10 @@ async def times(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         subscribed_chats[chat_id] = {}
     subscribed_chats[chat_id][user.id] = user.first_name
 
-    text = (f"Сегодня ({date_today_str}):\n"
+    text = (f"— Сегодня ({date_today_str}) —\n"
             f"🌅 Рассвет: {sunrise_today}\n"
             f"🌇 Закат: {sunset_today}\n\n"
-            f"Завтра ({date_tomorrow_str}):\n"
+            f"— Завтра ({date_tomorrow_str}) —\n"
             f"🌅 Рассвет: {sunrise_tomorrow}\n"
             f"🌇 Закат: {sunset_tomorrow}")
     await update.message.reply_text(text)
@@ -195,25 +197,26 @@ async def check_notifications():
 
         sunrise_dt = s["sunrise"]
         sunset_dt = s["sunset"]
-
-        sunrise_notif = sunrise_dt - timedelta(minutes=REMINDER_OFFSET)
-        sunset_notif = sunset_dt - timedelta(minutes=REMINDER_OFFSET)
         date_str = now.strftime("%Y-%m-%d")
+        offsets = [10, 30, 60]  # уведомления за 10, 30 и 60 минут до события
 
         for chat_id, subs in subscribed_chats.items():
             mentions = " ".join([f"<a href='tg://user?id={uid}'>{name}</a>" for uid, name in subs.items()])
-            
-            key_sr = (chat_id, now.date(), "sunrise")
-            if key_sr not in notified_events_global:
-                if now >= sunrise_notif and now < sunrise_notif + timedelta(seconds=60):
-                    msg = f"📅 {date_str}\n⏰ 10 мин до рассвета 🌅 {mentions}"
-                    await send_notification(chat_id, msg, key_sr)
-            
-            key_ss = (chat_id, now.date(), "sunset")
-            if key_ss not in notified_events_global:
-                if now >= sunset_notif and now < sunset_notif + timedelta(seconds=60):
-                    msg = f"📅 {date_str}\n⏰ 10 мин до заката 🌇 {mentions}"
-                    await send_notification(chat_id, msg, key_ss)
+            for offset in offsets:
+                # Уведомление для рассвета
+                sunrise_notif = sunrise_dt - timedelta(minutes=offset)
+                key_sr = (chat_id, now.date(), "sunrise", offset)
+                if key_sr not in notified_events_global:
+                    if now >= sunrise_notif and now < sunrise_notif + timedelta(seconds=60):
+                        msg = f"📅 {date_str}\n⏰ {offset} мин до рассвета 🌅 {mentions}"
+                        await send_notification(chat_id, msg, key_sr)
+                # Уведомление для заката
+                sunset_notif = sunset_dt - timedelta(minutes=offset)
+                key_ss = (chat_id, now.date(), "sunset", offset)
+                if key_ss not in notified_events_global:
+                    if now >= sunset_notif and now < sunset_notif + timedelta(seconds=60):
+                        msg = f"📅 {date_str}\n⏰ {offset} мин до заката 🌇 {mentions}"
+                        await send_notification(chat_id, msg, key_ss)
     except Exception as e:
         logging.exception("Unhandled exception in check_notifications: %s", e)
 
@@ -234,7 +237,7 @@ async def set_bot_commands(app: Application) -> None:
     cmds = [
         BotCommand("start", "Начало 😀"),
         BotCommand("setlocation", "📍 Локация"),
-        BotCommand("times", f"⏰ Время (напоминание за {REMINDER_OFFSET} мин)"),
+        BotCommand("times", "⏰ Время (с данными на сегодня и завтра)"),
         BotCommand("test", "🧪 Тест уведомлений")
     ]
     await app.bot.set_my_commands(cmds)
