@@ -74,7 +74,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Привет! 😀\n\n"
         "Команды:\n"
         "📍 /setlocation – установить локацию\n"
-        "⏰ /times – время рассвета/заката на сегодня и завтра (напоминания)\n"
+        "⏰ /times – время восхода/заката на сегодня и завтра (напоминания)\n"
         "🧪 /test – тест уведомлений"
     )
     await update.message.reply_text(text)
@@ -203,12 +203,12 @@ async def check_notifications():
         for chat_id, subs in subscribed_chats.items():
             mentions = " ".join([f"<a href='tg://user?id={uid}'>{name}</a>" for uid, name in subs.items()])
             for offset in offsets:
-                # Уведомление для рассвета
+                # Уведомление для восхода
                 sunrise_notif = sunrise_dt - timedelta(minutes=offset)
                 key_sr = (chat_id, now.date(), "sunrise", offset)
                 if key_sr not in notified_events_global:
                     if now >= sunrise_notif and now < sunrise_notif + timedelta(seconds=60):
-                        msg = f"📅 {date_str}\n⏰ {offset} мин до рассвета 🌅 {mentions}"
+                        msg = f"📅 {date_str}\n⏰ {offset} мин до восхода 🌅 {mentions}"
                         await send_notification(chat_id, msg, key_sr)
                 # Уведомление для заката
                 sunset_notif = sunset_dt - timedelta(minutes=offset)
@@ -268,9 +268,9 @@ async def test(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sunrise = s["sunrise"].strftime("%H:%M:%S")
     sunset = s["sunset"].strftime("%H:%M:%S")
     date_str = now.strftime("%Y-%m-%d")
-    test_msg_sr = f"[TEST] 📅 {date_str}\n⏰ 10 мин до рассвета 🌅 (тестовое уведомление)"
+    test_msg_sr = f"[TEST] 📅 {date_str}\n⏰ 10 мин до восхода 🌅 (тестовое уведомление)"
     test_msg_ss = f"[TEST] 📅 {date_str}\n⏰ 10 мин до заката 🌇 (тестовое уведомление)"
-    await update.message.reply_text(f"Тест: время рассвета {sunrise}, время заката {sunset}")
+    await update.message.reply_text(f"Тест: время восхода {sunrise}, время заката {sunset}")
     await update.message.reply_text(test_msg_sr)
     await update.message.reply_text(test_msg_ss)
 
