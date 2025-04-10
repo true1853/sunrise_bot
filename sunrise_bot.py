@@ -145,10 +145,10 @@ async def times(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     subscribed_chats[chat_id][user.id] = user.first_name
 
     text = (f"— Сегодня ({date_today_str}) —\n"
-            f"🌅 Рассвет: {sunrise_today}\n"
+            f"🌅 Восход: {sunrise_today}\n"
             f"🌇 Закат: {sunset_today}\n\n"
             f"— Завтра ({date_tomorrow_str}) —\n"
-            f"🌅 Рассвет: {sunrise_tomorrow}\n"
+            f"🌅 Восход: {sunrise_tomorrow}\n"
             f"🌇 Закат: {sunset_tomorrow}")
     await update.message.reply_text(text)
 
